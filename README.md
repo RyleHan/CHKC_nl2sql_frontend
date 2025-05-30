@@ -1,51 +1,64 @@
-# CHKC (Chat Knowledge Center)
+# CHKC 
 
-## 项目介绍 | Project Description
-CHKC是一个基于Web的聊天知识中心系统，提供了用户友好的界面来管理和交互聊天内容。
+智能项目推荐前端
 
-CHKC is a web-based Chat Knowledge Center system that provides a user-friendly interface for managing and interacting with chat content.
+## 🚀 快速开始 | Quick Start
 
-## 功能特点 | Features
-- 用户认证系统 | User authentication system
-- 聊天内容管理 | Chat content management
-- 响应式界面设计 | Responsive interface design
-- API集成 | API integration
+### 前置要求 | Prerequisites
+- Python 3.x
+- 现代浏览器（支持ES6+）| Modern browser (ES6+ support)
 
-## 技术栈 | Tech Stack
-- HTML5
-- CSS3
-- JavaScript (ES6+)
-- RESTful API
+### 安装步骤 | Installation Steps
 
-## 项目结构 | Project Structure
-```
-CHKC_v1/
-├── index.html          # 主页面
-├── style.css          # 样式文件
-├── script.js          # 主要JavaScript逻辑
-├── agentConfig.js     # 代理配置
-├── agentApi.js        # API接口
-└── authUtils.js       # 认证工具
-```
-
-## 开始使用 | Getting Started
-1. 克隆仓库 | Clone the repository
+1. 克隆项目 | Clone the project
 ```bash
-git clone [repository-url]
-```
-
-2. 打开项目 | Open the project
-```bash
+git clone https://github.com/RyleHan/CHKC_nl2sql_frontend.git
 cd CHKC_v1
 ```
 
-3. 在浏览器中打开 | Open in browser
-在浏览器中打开 `index.html` 文件
+2. 配置认证信息 | Configure Authentication
+打开 `agentConfig.js` 文件，修改以下配置：
+```javascript
+auth: {
+    authKey: 'your_auth_key',        // 替换为你的authKey
+    authSecret: 'your_auth_secret',  // 替换为你的authSecret
+    agentId: 'your_agent_id'        // 替换为你的Agent ID
+}
+```
 
-## 贡献 | Contributing
-欢迎提交问题和合并请求。
+3. 启动本地服务器 | Start local server
+```bash
+python3 -m http.server
+```
 
-Issues and pull requests are welcome.
+4. 访问应用 | Access the application
+在浏览器中打开：
+```
+http://localhost:8000
+```
 
-## 许可证 | License
-MIT 
+## 📁 项目结构 | Project Structure
+
+```
+CHKC_nl2sql_frontend/
+├── index.html          # 主页面 | Main page
+├── style.css          # 样式文件 | Styles
+├── script.js          # 主要业务逻辑 | Main business logic
+├── agentConfig.js     # 代理配置 | Agent configuration
+├── agentApi.js        # API接口封装 | API interface
+└── authUtils.js       # 认证工具 | Authentication utilities
+```
+
+
+
+## 📝 问题反馈 | Issues
+
+如果你发现任何问题或有改进建议，请在GitHub Issues中提出。
+
+If you find any issues or have suggestions for improvements, please raise them in GitHub Issues.
+
+## 📄 许可证 | License
+
+本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 了解详情
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details 
