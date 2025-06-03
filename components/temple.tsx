@@ -22,14 +22,6 @@ import {
 } from "lucide-react"
 import { motion, AnimatePresence } from "framer-motion"
 import * as React from "react"
-import { ChatService } from '../services/chatService';
-import { ChatStreamResponse } from '../types/chat';
-import settings from '../config/settings';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import rehypeHighlight from 'rehype-highlight';
-import { Components } from 'react-markdown';
-import type { ComponentPropsWithoutRef } from 'react';
 
 interface UseAutoResizeTextareaProps {
   minHeight: number
@@ -176,7 +168,6 @@ interface FileUpload {
   name: string
   size: string
   type: string
-  file: File  // 添加实际文件对象
 }
 
 interface ArtifactData {
@@ -190,22 +181,16 @@ interface ArtifactData {
 
 const ProjectRetrievalModeContext = React.createContext(false)
 
-interface CodeProps extends ComponentPropsWithoutRef<'code'> {
-  inline?: boolean;
-  className?: string;
-  node?: any;
-}
-
 export function AnimatedAIChat() {
   const [value, setValue] = useState("")
   const [attachments, setAttachments] = useState<string[]>([])
-  const [uploadedFiles, setUploadedFiles] = useState<FileUpload[]>([])
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([])  // 新增：保存已确认的文件对象
+  const [isTyping, setIsTyping] = useState(false)
   const [isPending, startTransition] = useTransition()
   const [mousePosition, setMousePosition] = useState({ x: 0, y: 0 })
   const [messages, setMessages] = useState<Message[]>([])
   const [hasStartedChat, setHasStartedChat] = useState(false)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
+  const [uploadedFiles, setUploadedFiles] = useState<FileUpload[]>([])
   const [showArtifacts, setShowArtifacts] = useState(false)
   const [currentArtifact, setCurrentArtifact] = useState<ArtifactData | null>(null)
   const [artifactMode, setArtifactMode] = useState<"preview" | "code">("preview")
@@ -228,9 +213,6 @@ export function AnimatedAIChat() {
   const chatContainerRef = useRef<HTMLDivElement>(null)
   const artifactsContainerRef = useRef<HTMLDivElement>(null)
 
-  const chatService = useRef(new ChatService()).current;
-  const [currentResponse, setCurrentResponse] = useState<string>('');
-
   const commandOptions: CommandOption[] = [
     {
       id: "report",
@@ -247,22 +229,6 @@ export function AnimatedAIChat() {
       prefix: "/project",
     },
   ]
-
-  // 获取当前激活的 agentId
-  const getCurrentAgentId = useCallback(() => {
-    if (activeCommands.has('report')) {
-      return settings.AGENT_UUIDS.REPORT_WRITING;
-    } else if (activeCommands.has('project-retrieval')) {
-      return settings.AGENT_UUIDS.PROJECT_RECOMMEND;
-    }
-    return settings.AGENT_UUIDS.NORMAL_QA;
-  }, [activeCommands]);
-
-  // 更新 ChatService 的 agentId
-  useEffect(() => {
-    const agentId = getCurrentAgentId();
-    chatService.updateAgentId(agentId);
-  }, [activeCommands, getCurrentAgentId]);
 
   // Parse code blocks from message content
   const parseCodeBlocks = (
@@ -451,184 +417,113 @@ export function AnimatedAIChat() {
     }
   }
 
-  const handleSendMessage = async () => {
+  const handleSendMessage = () => {
     if (value.trim()) {
       const isProjectRetrievalActive = activeCommands.has("project-retrieval")
 
       const userMessage: Message = {
-        id: `msg-${performance.now().toString().replace('.', '')}`,
+        id: Date.now().toString(),
         content: value.trim(),
         role: "user",
         timestamp: new Date(),
-        isProjectRetrieval: isProjectRetrievalActive,
+        isProjectRetrieval: isProjectRetrievalActive, // 记录创建时的模式
       }
 
       setMessages((prev) => [...prev, userMessage])
       setHasStartedChat(true)
       setValue("")
-      setCurrentResponse("")
 
       // Reset input field state
       setTimeout(() => {
         adjustHeight(true)
         setInputFocused(false)
-        setActiveCommands(new Set())
+        setActiveCommands(new Set()) // Clear active commands after sending
       }, 0)
 
-      // 使用已确认的文件列表
-      const filesToUpload = [...selectedFiles]
-      setSelectedFiles([]) // 清空已选文件
-      setAttachments([]) // 清空附件显示
+      if (attachments.length > 0) {
+        setAttachments([])
+      }
 
       // Re-enable auto-scroll for new messages
       setShouldScrollToBottom(true)
 
       startTransition(() => {
-        // 创建初始占位消息
-        const tempMessageId = `temp-${Date.now()}-${Math.floor(Math.random() * 1000)}`
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: tempMessageId,
-            content: "",
+        setIsTyping(true)
+        setTimeout(() => {
+          // Generate response based on user input
+          let responseContent = ""
+
+          if (userMessage.content.includes("/project") || userMessage.content.includes("项目检索")) {
+            responseContent = `我来为您检索项目数据。以下是当前的项目信息：
+
+\`\`\`table title="项目检索结果"
+| 项目ID | 项目名称 | 状态 | 负责人 | 创建时间 | 最后更新 | 进度 | 预算(万元) | 优先级 |
+|--------|----------|------|--------|----------|----------|------|------------|--------|
+| PRJ001 | AI聊天界面优化 | 进行中 | 张三 | 2024-01-15 | 2024-01-20 | 75% | 50 | 高 |
+| PRJ002 | 数据分析平台 | 已完成 | 李四 | 2024-01-10 | 2024-01-18 | 100% | 120 | 中 |
+| PRJ003 | 移动应用开发 | 暂停 | 王五 | 2024-01-12 | 2024-01-19 | 30% | 80 | 低 |
+| PRJ004 | 云服务迁移 | 计划中 | 赵六 | 2024-01-14 | 2024-01-21 | 5% | 200 | 高 |
+| PRJ005 | 安全审计系统 | 进行中 | 孙七 | 2024-01-16 | 2024-01-22 | 60% | 90 | 高 |
+| PRJ006 | 用户体验优化 | 已完成 | 周八 | 2024-01-08 | 2024-01-15 | 100% | 35 | 中 |
+| PRJ007 | 数据库性能优化 | 进行中 | 吴九 | 2024-01-20 | 2024-01-23 | 45% | 60 | 中 |
+| PRJ008 | 微服务架构升级 | 计划中 | 郑十 | 2024-01-22 | 2024-01-24 | 10% | 150 | 高 |
+| PRJ009 | 自动化测试平台 | 进行中 | 王十一 | 2024-01-18 | 2024-01-21 | 80% | 70 | 中 |
+| PRJ010 | 监控告警系统 | 已完成 | 李十二 | 2024-01-05 | 2024-01-12 | 100% | 45 | 低 |
+\`\`\``
+          } else if (userMessage.content.includes("/report") || userMessage.content.includes("报告")) {
+            responseContent = `我来为您生成一份专业报告。以下是根据您的需求创建的报告文档：
+
+\`\`\`report title="市场分析报告"
+# 2024年市场分析报告
+
+## 执行摘要
+
+本报告对2024年市场趋势进行了深入分析，重点关注技术创新、消费者行为变化以及竞争格局的演变。
+
+## 主要发现
+
+### 1. 技术趋势分析
+- **人工智能集成**：AI技术在各行业的应用持续增长
+- **云计算普及**：企业数字化转型加速
+- **可持续技术**：绿色技术投资增长40%
+
+### 2. 消费者行为变化
+- **数字化购物习惯**：线上购物渗透率达到78%
+- **个性化需求增长**：87%的消费者期望个性化服务体验
+- **环保意识提升**：72%的消费者愿意为环保产品支付溢价
+
+## 结论
+
+2024年将是充满机遇与挑战的关键一年。企业需要在技术创新、市场拓展和运营优化之间找到平衡点。
+\`\`\``
+          } else {
+            responseContent =
+              "我是一个AI助手，很高兴为您服务！我可以帮助您解答问题、提供建议或协助完成各种任务。请告诉我您需要什么帮助？"
+          }
+
+          const { content, codeBlocks } = parseCodeBlocks(responseContent, isProjectRetrievalActive)
+
+          const assistantMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            content,
             role: "assistant",
             timestamp: new Date(),
-            codeBlocks: [],
-            isProjectRetrieval: isProjectRetrievalActive,
-          },
-        ])
+            codeBlocks,
+            isProjectRetrieval: isProjectRetrievalActive, // 记录创建时的模式
+          }
 
-        // 调用聊天服务，传入已确认的文件
-        chatService
-          .chatStream(value.trim(), activeCommands, filesToUpload)
-          .then(async (stream) => {
-            const reader = stream.getReader()
-            const decoder = new TextDecoder()
-            let buffer = "" // 用于存储不完整的数据
-            let isInCodeBlock = false
-            let currentCodeBlock: CodeBlock | null = null
-            let normalTextBuffer = ""
+          setMessages((prev) => [...prev, assistantMessage])
 
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
+          // If there are code blocks, show artifacts
+          if (codeBlocks.length > 0) {
+            const artifact = createArtifact(codeBlocks[0], assistantMessage.id)
+            setCurrentArtifact(artifact)
+            setShowArtifacts(true)
+            setArtifactMode("preview")
+          }
 
-              const chunk = decoder.decode(value)
-              buffer += chunk // 将新数据添加到缓冲区
-
-              // 按行分割并处理完整的数据行
-              const lines = buffer.split("\n")
-              buffer = lines.pop() || "" // 保留最后一个可能不完整的行
-
-              for (const line of lines) {
-                if (line.startsWith("data:")) {
-                  try {
-                    const jsonStr = line.slice(5).trim()
-                    if (jsonStr) {
-                      const data = JSON.parse(jsonStr) as ChatStreamResponse
-                      if (data.content) {
-                        // 处理代码块开始标记
-                        const codeBlockStartMatch = data.content.match(/^```(\w+)(?:\s+title="([^"]*)")?/)
-                        if (codeBlockStartMatch && !isInCodeBlock) {
-                          // 如果有累积的普通文本，先更新
-                          if (normalTextBuffer) {
-                            setMessages((prev) =>
-                              prev.map((msg) =>
-                                msg.id === tempMessageId
-                                  ? { ...msg, content: msg.content + normalTextBuffer }
-                                  : msg
-                              )
-                            )
-                            normalTextBuffer = ""
-                          }
-
-                          isInCodeBlock = true
-                          currentCodeBlock = {
-                            language: codeBlockStartMatch[1],
-                            title: codeBlockStartMatch[2] || getDefaultTitle(codeBlockStartMatch[1]),
-                            content: "",
-                            isProjectRetrieval: isProjectRetrievalActive,
-                          }
-                          continue
-                        }
-
-                        // 处理代码块结束标记
-                        if (data.content.startsWith("```") && isInCodeBlock) {
-                          isInCodeBlock = false
-                          if (currentCodeBlock) {
-                            setMessages((prev) =>
-                              prev.map((msg) =>
-                                msg.id === tempMessageId
-                                  ? {
-                                      ...msg,
-                                      codeBlocks: [...(msg.codeBlocks || []), currentCodeBlock!],
-                                    }
-                                  : msg
-                              )
-                            )
-                            currentCodeBlock = null
-                          }
-                          continue
-                        }
-
-                        // 处理代码块内容
-                        if (isInCodeBlock && currentCodeBlock) {
-                          currentCodeBlock.content += data.content + "\n"
-                        } else {
-                          // 累积普通文本
-                          normalTextBuffer += data.content
-                        }
-                      }
-
-                      // 保存 chatId 到聊天状态
-                      if (data.chatId) {
-                        const agentId = getCurrentAgentId()
-                        const chatState = chatService.getChatState(agentId)
-                        chatState.chatId = data.chatId
-                      }
-
-                      if (data.finish) {
-                        // 处理最后可能剩余的普通文本
-                        if (normalTextBuffer) {
-                          setMessages((prev) =>
-                            prev.map((msg) =>
-                              msg.id === tempMessageId
-                                ? { ...msg, content: msg.content + normalTextBuffer }
-                                : msg
-                            )
-                          )
-                        }
-
-                        // 如果有未完成的代码块，也添加到消息中
-                        if (isInCodeBlock && currentCodeBlock) {
-                          setMessages((prev) =>
-                            prev.map((msg) =>
-                              msg.id === tempMessageId
-                                ? {
-                                    ...msg,
-                                    codeBlocks: [...(msg.codeBlocks || []), currentCodeBlock!],
-                                  }
-                                : msg
-                            )
-                          )
-                        }
-
-                        setCurrentResponse("")
-                      }
-                    }
-                  } catch (error) {
-                    console.error("解析 SSE 数据失败:", error, "原始数据:", line)
-                  }
-                }
-              }
-            }
-          })
-          .catch((error) => {
-            console.error("Chat error:", error)
-            setCurrentResponse("")
-            // 移除占位消息
-            setMessages((prev) => prev.filter((msg) => msg.id !== tempMessageId))
-          })
+          setIsTyping(false)
+        }, 2000)
       })
     }
   }
@@ -641,45 +536,41 @@ export function AnimatedAIChat() {
     const files = e.target.files
     if (files && files.length > 0) {
       const newFiles: FileUpload[] = []
+
       for (let i = 0; i < files.length; i++) {
         const file = files[i]
         const fileSizeInKB = Math.round(file.size / 1024)
         const fileSizeStr = fileSizeInKB < 1024 ? `${fileSizeInKB} KB` : `${(fileSizeInKB / 1024).toFixed(1)} MB`
-        
-        // 验证文件大小
-        const MAX_SIZE = 10 * 1024 * 1024 // 10MB
-        if (file.size > MAX_SIZE) {
-          alert(`文件 ${file.name} 大小超过10MB限制`)
-          continue
-        }
 
         newFiles.push({
           name: file.name,
           size: fileSizeStr,
           type: file.type,
-          file: file  // 保存实际文件对象
         })
       }
+
       setUploadedFiles([...uploadedFiles, ...newFiles])
     }
   }
 
   const confirmFileUpload = () => {
-    // 保存实际文件对象
-    const newFiles = uploadedFiles.map(f => f.file)
-    setSelectedFiles(prev => [...prev, ...newFiles])
-    
-    // 更新显示用的附件列表
     const newAttachments = uploadedFiles.map((file) => file.name)
     setAttachments([...attachments, ...newAttachments])
-    
     setUploadedFiles([])
     setShowUploadDialog(false)
   }
 
+  const cancelFileUpload = () => {
+    setUploadedFiles([])
+    setShowUploadDialog(false)
+  }
+
+  const removeUploadedFile = (index: number) => {
+    setUploadedFiles((prev) => prev.filter((_, i) => i !== index))
+  }
+
   const removeAttachment = (index: number) => {
-    setSelectedFiles(prev => prev.filter((_, i) => i !== index))  // 同时移除实际文件
-    setAttachments(prev => prev.filter((_, i) => i !== index))
+    setAttachments((prev) => prev.filter((_, i) => i !== index))
   }
 
   const handleArtifactToggle = (artifact: ArtifactData) => {
@@ -773,126 +664,6 @@ export function AnimatedAIChat() {
   `
   }
 
-  const renderMessageContent = (message: Message) => {
-    if (message.role === "user") {
-      return <div className="text-white">{message.content}</div>;
-    }
-
-    const components: Components = {
-      code({ node, inline, className, children, ...props }: CodeProps) {
-        if (inline) {
-          return (
-            <code className="bg-gray-100 rounded px-1 text-gray-800" {...props}>
-              {children}
-            </code>
-          );
-        }
-
-        const match = /language-(\w+)/.exec(className || "");
-        const language = match ? match[1] : "";
-        const content = String(children).trim();
-        
-        // 创建代码块对象
-        const codeBlock: CodeBlock = {
-          language,
-          content,
-          title: language ? getDefaultTitle(language) : "Code",
-          isProjectRetrieval: message.isProjectRetrieval,
-        };
-
-        // 更新消息的代码块列表
-        if (!message.codeBlocks) {
-          message.codeBlocks = [];
-        }
-        const existingIndex = message.codeBlocks.findIndex(
-          (cb) => cb.content === content && cb.language === language
-        );
-        if (existingIndex === -1) {
-          message.codeBlocks.push(codeBlock);
-        }
-
-        const artifact = createArtifact(codeBlock, message.id);
-        return (
-          <div className="my-4">
-            <motion.button
-              onClick={() => handleArtifactToggle(artifact)}
-              className={cn(
-                "flex items-center gap-2 px-4 py-2 rounded-lg transition-all",
-                message.isProjectRetrieval
-                  ? "bg-blue-100 text-blue-800 hover:bg-blue-200"
-                  : "bg-green-100 text-green-800 hover:bg-green-200"
-              )}
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
-            >
-              <Code className="w-4 h-4" />
-              <span>查看 {codeBlock.title}</span>
-            </motion.button>
-          </div>
-        );
-      },
-      h1: (props: ComponentPropsWithoutRef<'h1'>) => (
-        <h1 className="text-2xl font-bold text-gray-900 mb-6 pb-3 border-b border-gray-200" {...props} />
-      ),
-      h2: (props: ComponentPropsWithoutRef<'h2'>) => (
-        <h2 className="text-xl font-semibold text-gray-800 mb-4 mt-8" {...props} />
-      ),
-      h3: (props: ComponentPropsWithoutRef<'h3'>) => (
-        <h3 className="text-lg font-medium text-gray-700 mb-3 mt-6" {...props} />
-      ),
-      p: (props: ComponentPropsWithoutRef<'p'>) => (
-        <p className="mb-4 text-gray-700 leading-relaxed" {...props} />
-      ),
-      ul: (props: ComponentPropsWithoutRef<'ul'>) => (
-        <ul className="list-disc ml-6 mb-4 text-gray-700" {...props} />
-      ),
-      ol: (props: ComponentPropsWithoutRef<'ol'>) => (
-        <ol className="list-decimal ml-6 mb-4 text-gray-700" {...props} />
-      ),
-      li: (props: ComponentPropsWithoutRef<'li'>) => (
-        <li className="mb-2" {...props} />
-      ),
-      blockquote: (props: ComponentPropsWithoutRef<'blockquote'>) => (
-        <blockquote className="border-l-4 border-green-500 pl-4 py-2 my-4 bg-green-50 text-gray-700 italic" {...props} />
-      ),
-      a: (props: ComponentPropsWithoutRef<'a'>) => (
-        <a className="text-green-600 hover:text-green-700 underline" target="_blank" rel="noopener noreferrer" {...props} />
-      ),
-      table: (props: ComponentPropsWithoutRef<'table'>) => (
-        <div className="overflow-auto max-h-[70vh] max-w-full">
-          <table className="w-full border-collapse border border-gray-300 rounded-lg overflow-hidden min-w-max" {...props} />
-        </div>
-      ),
-      thead: (props: ComponentPropsWithoutRef<'thead'>) => (
-        <thead className="bg-gray-50 sticky top-0" {...props} />
-      ),
-      tbody: (props: ComponentPropsWithoutRef<'tbody'>) => (
-        <tbody {...props} />
-      ),
-      tr: (props: ComponentPropsWithoutRef<'tr'>) => (
-        <tr className="hover:bg-gray-50 transition-colors" {...props} />
-      ),
-      th: (props: ComponentPropsWithoutRef<'th'>) => (
-        <th className="border border-gray-200 px-4 py-3 text-left font-semibold text-gray-900 whitespace-nowrap" {...props} />
-      ),
-      td: (props: ComponentPropsWithoutRef<'td'>) => (
-        <td className="border border-gray-200 px-4 py-3 text-gray-700 whitespace-nowrap" {...props} />
-      ),
-    };
-
-    return (
-      <div className="prose prose-sm max-w-none text-gray-900 leading-relaxed">
-        <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
-          rehypePlugins={[rehypeHighlight]}
-          components={components}
-        >
-          {message.content}
-        </ReactMarkdown>
-      </div>
-    );
-  };
-
   return (
     <ProjectRetrievalModeContext.Provider value={isProjectRetrievalMode}>
       <div className="min-h-screen flex w-full bg-gradient-to-br from-gray-50 via-white to-gray-50 text-gray-900 relative overflow-hidden font-apple">
@@ -967,7 +738,7 @@ export function AnimatedAIChat() {
                                   : "bg-white text-gray-900 assistant border border-gray-200/80 backdrop-blur-sm",
                               )}
                             >
-                              {message.content ? renderMessageContent(message) : (message.role === "assistant" && <TypingDots />)}
+                              {message.content}
                             </div>
 
                             {/* Enhanced Code Block Preview Cards */}
@@ -1079,6 +850,21 @@ export function AnimatedAIChat() {
                           )}
                         </motion.div>
                       ))}
+
+                      {isTyping && (
+                        <motion.div
+                          className="flex gap-4 justify-start"
+                          initial={{ opacity: 0, y: 20 }}
+                          animate={{ opacity: 1, y: 0 }}
+                        >
+                          <div className="w-10 h-10 rounded-full bg-gradient-to-br from-green-100 to-green-200 flex items-center justify-center flex-shrink-0 shadow-sm border border-green-200/50">
+                            <Bot className="w-5 h-5 text-green-700" />
+                          </div>
+                          <div className="bg-white rounded-2xl px-6 py-4 shadow-sm border border-gray-200/80 backdrop-blur-sm">
+                            <TypingDots />
+                          </div>
+                        </motion.div>
+                      )}
                     </div>
                     <div ref={messagesEndRef} />
                   </motion.div>
@@ -1230,10 +1016,7 @@ export function AnimatedAIChat() {
                           <div className="flex justify-between items-center mb-4">
                             <h3 className="text-base font-semibold text-gray-800">上传文件</h3>
                             <button
-                              onClick={() => {
-                                setSelectedFiles([])
-                                setShowUploadDialog(false)
-                              }}
+                              onClick={cancelFileUpload}
                               className="text-gray-400 hover:text-gray-600 p-1 rounded-lg hover:bg-gray-100 transition-colors"
                             >
                               <XIcon className="w-4 h-4" />
@@ -1276,9 +1059,7 @@ export function AnimatedAIChat() {
                                       <span className="text-gray-500 flex-shrink-0 text-xs">{file.size}</span>
                                     </div>
                                     <button
-                                      onClick={() => {
-                                        setSelectedFiles(prev => prev.filter((_, i) => i !== index))
-                                      }}
+                                      onClick={() => removeUploadedFile(index)}
                                       className="text-gray-400 hover:text-red-500 ml-3 flex-shrink-0 p-1 rounded hover:bg-red-50 transition-colors"
                                     >
                                       <XIcon className="w-3 h-3" />
@@ -1291,10 +1072,7 @@ export function AnimatedAIChat() {
 
                           <div className="flex justify-end gap-3">
                             <button
-                              onClick={() => {
-                                setSelectedFiles([])
-                                setShowUploadDialog(false)
-                              }}
+                              onClick={cancelFileUpload}
                               className="px-4 py-2 text-sm text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
                             >
                               取消
@@ -1480,7 +1258,7 @@ export function AnimatedAIChat() {
                       onClick={handleSendMessage}
                       whileHover={{ scale: 1.02 }}
                       whileTap={{ scale: 0.98 }}
-                      disabled={!value.trim()}
+                      disabled={isTyping || !value.trim()}
                       className={cn(
                         "px-6 py-3 rounded-xl text-sm font-medium transition-all",
                         "flex items-center gap-2 button-hover-effect",
@@ -1491,7 +1269,11 @@ export function AnimatedAIChat() {
                           : "bg-gray-100 text-gray-400 cursor-not-allowed",
                       )}
                     >
-                      <SendIcon className="w-4 h-4" />
+                      {isTyping ? (
+                        <LoaderIcon className="w-4 h-4 animate-[spin_2s_linear_infinite]" />
+                      ) : (
+                        <SendIcon className="w-4 h-4" />
+                      )}
                       <span>发送</span>
                     </motion.button>
                   </div>
