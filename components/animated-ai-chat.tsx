@@ -8,16 +8,11 @@ import {
   Command,
   SendIcon,
   XIcon,
-  LoaderIcon,
-  Sparkles,
   User,
   Bot,
   Upload,
   Check,
   Code,
-  Eye,
-  Maximize2,
-  Minimize2,
   Copy,
 } from "lucide-react"
 import { motion, AnimatePresence } from "framer-motion"
@@ -30,6 +25,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { Components } from 'react-markdown';
 import type { ComponentPropsWithoutRef } from 'react';
+import { throttle } from 'lodash';
 
 interface UseAutoResizeTextareaProps {
   minHeight: number
@@ -106,6 +102,7 @@ interface CommandOption {
   label: string
   description: string
   prefix: string
+  disabled?: boolean
 }
 
 interface TextareaProps extends React.TextareaHTMLAttributes<HTMLTextAreaElement> {
@@ -156,36 +153,19 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
 )
 Textarea.displayName = "Textarea"
 
-interface CodeBlock {
-  language: string
-  content: string
-  title?: string
-  isProjectRetrieval?: boolean // 添加模式标识
-}
-
 interface Message {
   id: string
   content: string
   role: "user" | "assistant"
   timestamp: Date
-  codeBlocks?: CodeBlock[]
-  isProjectRetrieval?: boolean // 添加模式标识
+  isProjectRetrieval?: boolean
 }
 
 interface FileUpload {
   name: string
   size: string
   type: string
-  file: File  // 添加实际文件对象
-}
-
-interface ArtifactData {
-  id: string
-  title: string
-  language: string
-  content: string
-  messageId: string
-  isProjectRetrieval?: boolean
+  file: File
 }
 
 const ProjectRetrievalModeContext = React.createContext(false)
@@ -196,22 +176,45 @@ interface CodeProps extends ComponentPropsWithoutRef<'code'> {
   node?: any;
 }
 
+// 添加文件类型和大小常量
+const FILE_CONSTRAINTS = {
+  MAX_SIZE: 10 * 1024 * 1024, // 10MB
+  ALLOWED_TYPES: [
+    "text/plain",
+    "application/pdf",
+    "application/json",
+    "text/markdown",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // .docx
+    "application/msword", // .doc
+    "application/vnd.ms-excel", // .xls
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // .xlsx
+  ],
+  MAX_FILES: 5, // 最大文件数量限制
+  ALLOWED_EXTENSIONS: ['.pdf', '.docx', '.xlsx', '.doc', '.xls', '.txt', '.json', '.md'],
+};
+
+// 添加滚动相关的常量
+const SCROLL_CONSTANTS = {
+  SCROLL_THRESHOLD: 100, // 距离底部多少像素时触发自动滚动
+  SCROLL_DELAY: 100, // 滚动延迟时间（毫秒）
+  UPDATE_THROTTLE: 100, // 消息更新节流时间（毫秒）
+};
+
 export function AnimatedAIChat() {
   const [value, setValue] = useState("")
   const [attachments, setAttachments] = useState<string[]>([])
   const [uploadedFiles, setUploadedFiles] = useState<FileUpload[]>([])
-  const [selectedFiles, setSelectedFiles] = useState<File[]>([])  // 新增：保存已确认的文件对象
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isPending, startTransition] = useTransition()
   const [mousePosition, setMousePosition] = useState({ x: 0, y: 0 })
   const [messages, setMessages] = useState<Message[]>([])
   const [hasStartedChat, setHasStartedChat] = useState(false)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
-  const [showArtifacts, setShowArtifacts] = useState(false)
-  const [currentArtifact, setCurrentArtifact] = useState<ArtifactData | null>(null)
-  const [artifactMode, setArtifactMode] = useState<"preview" | "code">("preview")
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
   const [inputFocused, setInputFocused] = useState(false)
   const [shouldScrollToBottom, setShouldScrollToBottom] = useState(true)
+  const [isWaitingResponse, setIsWaitingResponse] = useState(false)
+  const [isComposing, setIsComposing] = useState(false)
 
   // Enhanced command system state
   const [showCommandMenu, setShowCommandMenu] = useState(false)
@@ -226,33 +229,24 @@ export function AnimatedAIChat() {
   const uploadDialogRef = useRef<HTMLDivElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const chatContainerRef = useRef<HTMLDivElement>(null)
-  const artifactsContainerRef = useRef<HTMLDivElement>(null)
 
   const chatService = useRef(new ChatService()).current;
   const [currentResponse, setCurrentResponse] = useState<string>('');
 
   const commandOptions: CommandOption[] = [
     {
-      id: "report",
-      icon: <Sparkles className="w-4 h-4" />,
-      label: "报告撰写",
-      description: "生成专业报告文档",
-      prefix: "/report",
-    },
-    {
       id: "project-retrieval",
       icon: <Code className="w-4 h-4" />,
       label: "项目检索",
       description: "检索和查看项目数据",
       prefix: "/project",
+      disabled: true,
     },
   ]
 
   // 获取当前激活的 agentId
   const getCurrentAgentId = useCallback(() => {
-    if (activeCommands.has('report')) {
-      return settings.AGENT_UUIDS.REPORT_WRITING;
-    } else if (activeCommands.has('project-retrieval')) {
+    if (activeCommands.has('project-retrieval')) {
       return settings.AGENT_UUIDS.PROJECT_RECOMMEND;
     }
     return settings.AGENT_UUIDS.NORMAL_QA;
@@ -264,81 +258,24 @@ export function AnimatedAIChat() {
     chatService.updateAgentId(agentId);
   }, [activeCommands, getCurrentAgentId]);
 
-  // Parse code blocks from message content
-  const parseCodeBlocks = (
-    content: string,
-    isProjectRetrieval = false,
-  ): { content: string; codeBlocks: CodeBlock[] } => {
-    const codeBlockRegex = /```(\w+)(?:\s+title="([^"]*)")?\s*\n([\s\S]*?)\n```/g
-    const codeBlocks: CodeBlock[] = []
-    let match
-
-    while ((match = codeBlockRegex.exec(content)) !== null) {
-      const [fullMatch, language, title, code] = match
-      codeBlocks.push({
-        language,
-        content: code.trim(),
-        title: title || getDefaultTitle(language),
-        isProjectRetrieval, // 传递模式标识
-      })
-    }
-
-    const cleanContent = content.replace(codeBlockRegex, "").trim()
-    return { content: cleanContent, codeBlocks }
-  }
-
-  const getDefaultTitle = (language: string): string => {
-    const titles: Record<string, string> = {
-      report: "报告文档",
-      markdown: "Markdown 文档",
-      latex: "LaTeX 文档",
-      json: "JSON 数据",
-      javascript: "JavaScript 代码",
-      typescript: "TypeScript 代码",
-      python: "Python 代码",
-      html: "HTML 文档",
-      css: "CSS 样式",
-      table: "数据表格",
-    }
-    return titles[language] || `${language.toUpperCase()} 文档`
-  }
-
-  const createArtifact = (codeBlock: CodeBlock, messageId: string): ArtifactData => {
-    return {
-      id: `artifact-${Date.now()}`,
-      title: codeBlock.title || getDefaultTitle(codeBlock.language),
-      language: codeBlock.language,
-      content: codeBlock.content,
-      messageId,
-      isProjectRetrieval: codeBlock.isProjectRetrieval, // 使用CodeBlock的模式标识
-    }
-  }
-
-  const renderMarkdown = (content: string): string => {
-    return content
-      .replace(/^# (.*$)/gm, '<h1 class="text-2xl font-bold text-gray-900 mb-6 pb-3 border-b border-gray-200">$1</h1>')
-      .replace(/^## (.*$)/gm, '<h2 class="text-xl font-semibold text-gray-800 mb-4 mt-8">$1</h2>')
-      .replace(/^### (.*$)/gm, '<h3 class="text-lg font-medium text-gray-700 mb-3 mt-6">$1</h3>')
-      .replace(/\*\*(.*?)\*\*/g, '<strong class="font-semibold text-gray-900">$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em class="italic text-gray-700">$1</em>')
-      .replace(/^- (.*$)/gm, '<li class="ml-6 mb-2 text-gray-700">$1</li>')
-      .replace(/^\d+\. (.*$)/gm, '<li class="ml-6 mb-2 text-gray-700">$1</li>')
-      .replace(/\n\n/g, '</p><p class="mb-4 text-gray-700 leading-relaxed">')
-      .replace(/\n/g, "<br>")
-      .replace(/^(.*)$/gm, '<p class="mb-4 text-gray-700 leading-relaxed">$1</p>')
-  }
+  // 使用 useRef 存储节流函数
+  const throttledUpdate = useRef(
+    throttle((messageId: string, content: string) => {
+      setMessages(prev => 
+        prev.map(msg => 
+          msg.id === messageId 
+            ? { ...msg, content } 
+            : msg
+        )
+      );
+    }, SCROLL_CONSTANTS.UPDATE_THROTTLE)
+  );
 
   const handleCopyMessage = async (message: Message) => {
-    const fullContent =
-      message.content +
-      (message.codeBlocks
-        ? "\n\n" + message.codeBlocks.map((block) => `\`\`\`${block.language}\n${block.content}\n\`\`\``).join("\n\n")
-        : "")
-
     try {
-      await navigator.clipboard.writeText(fullContent)
+      await navigator.clipboard.writeText(message.content)
       setCopiedMessageId(message.id)
-      setTimeout(() => setCopiedMessageId(null), 2000)
+      setTimeout(() => setCopiedMessageId(null), 2500)
     } catch (err) {
       console.error("Failed to copy text: ", err)
     }
@@ -358,14 +295,6 @@ export function AnimatedAIChat() {
     setActiveCommands((prev) => {
       const newSet = new Set(prev)
       newSet.delete(commandId)
-
-      // 如果取消的是项目检索，且当前显示的是项目检索相关的Artifacts，则隐藏
-      if (commandId === "project-retrieval" && currentArtifact?.isProjectRetrieval) {
-        setShowArtifacts(false)
-        setCurrentArtifact(null)
-        setShouldScrollToBottom(true)
-      }
-
       return newSet
     })
   }
@@ -424,36 +353,109 @@ export function AnimatedAIChat() {
     }
   }, [])
 
-  // Only scroll to bottom when new messages are added and shouldScrollToBottom is true
-  useEffect(() => {
-    if (chatContainerRef.current && shouldScrollToBottom) {
-      const scrollContainer = chatContainerRef.current
-      const isNearBottom =
-        scrollContainer.scrollTop + scrollContainer.clientHeight >= scrollContainer.scrollHeight - 100
-
-      if (isNearBottom || messages.length === 1) {
-        scrollContainer.scrollTop = scrollContainer.scrollHeight
-      }
+  // 优化自动滚动逻辑
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    if (messagesEndRef.current) {
+      messagesEndRef.current.scrollIntoView({
+        behavior,
+        block: 'end',
+      });
     }
-  }, [messages, shouldScrollToBottom])
+  }, []);
 
-  // Disable auto-scroll when artifacts are shown
+  // 优化滚动检测
+  const handleScroll = useCallback(() => {
+    if (!chatContainerRef.current) return;
+    
+    const { scrollTop, scrollHeight, clientHeight } = chatContainerRef.current;
+    const isNearBottom = scrollHeight - scrollTop - clientHeight < SCROLL_CONSTANTS.SCROLL_THRESHOLD;
+    
+    setShouldScrollToBottom(isNearBottom);
+  }, []);
+
+  // 添加滚动事件监听
   useEffect(() => {
-    setShouldScrollToBottom(!showArtifacts)
-  }, [showArtifacts])
+    const container = chatContainerRef.current;
+    if (container) {
+      container.addEventListener('scroll', handleScroll);
+      return () => container.removeEventListener('scroll', handleScroll);
+    }
+  }, [handleScroll]);
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault()
+  // 优化消息更新时的滚动行为
+  useEffect(() => {
+    if (shouldScrollToBottom) {
+      // 使用 requestAnimationFrame 确保在 DOM 更新后执行滚动
+      requestAnimationFrame(() => {
+        scrollToBottom('auto');
+      });
+    }
+  }, [messages, shouldScrollToBottom, scrollToBottom]);
+
+  // 优化状态重置
+  const resetChatState = useCallback(() => {
+    setMessages([]);
+    setHasStartedChat(false);
+    setValue("");
+    setCurrentResponse("");
+    setSelectedFiles([]);
+    setAttachments([]);
+    setUploadedFiles([]);
+    setShowUploadDialog(false);
+    setShouldScrollToBottom(true);
+  }, []);
+
+  // 添加页面刷新时的清理逻辑
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      resetChatState();
+    };
+    
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [resetChatState]);
+
+  // 优化消息发送后的状态更新
+  const updateMessageState = useCallback((message: Message) => {
+    setMessages(prev => [...prev, message]);
+    setHasStartedChat(true);
+    setValue("");
+    setCurrentResponse("");
+    
+    // 重置输入状态
+    requestAnimationFrame(() => {
+      adjustHeight(true);
+      setInputFocused(false);
+      setActiveCommands(new Set());
+    });
+    
+    // 启用自动滚动
+    setShouldScrollToBottom(true);
+  }, []);
+
+  // 添加键盘事件处理
+  const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey && !isWaitingResponse && !isComposing) {
+      e.preventDefault();
       if (value.trim()) {
-        handleSendMessage()
+        handleSendMessage();
       }
     }
-  }
+  }, [value, isWaitingResponse, isComposing]);
+
+  const handleCompositionStart = useCallback(() => {
+    setIsComposing(true);
+  }, []);
+
+  const handleCompositionEnd = useCallback(() => {
+    setIsComposing(false);
+  }, []);
 
   const handleSendMessage = async () => {
     if (value.trim()) {
-      const isProjectRetrievalActive = activeCommands.has("project-retrieval")
+      const isProjectRetrievalActive = activeCommands.has("project-retrieval");
 
       const userMessage: Message = {
         id: `msg-${performance.now().toString().replace('.', '')}`,
@@ -461,31 +463,24 @@ export function AnimatedAIChat() {
         role: "user",
         timestamp: new Date(),
         isProjectRetrieval: isProjectRetrievalActive,
-      }
+      };
 
-      setMessages((prev) => [...prev, userMessage])
-      setHasStartedChat(true)
-      setValue("")
-      setCurrentResponse("")
-
-      // Reset input field state
-      setTimeout(() => {
-        adjustHeight(true)
-        setInputFocused(false)
-        setActiveCommands(new Set())
-      }, 0)
+      updateMessageState(userMessage);
+      
+      // 设置等待响应状态
+      setIsWaitingResponse(true);
+      
+      // 立即滚动到底部
+      requestAnimationFrame(() => {
+        scrollToBottom('auto');
+      });
 
       // 使用已确认的文件列表
-      const filesToUpload = [...selectedFiles]
-      setSelectedFiles([]) // 清空已选文件
-      setAttachments([]) // 清空附件显示
-
-      // Re-enable auto-scroll for new messages
-      setShouldScrollToBottom(true)
+      const filesToSend = Array.from(fileMap.values());
 
       startTransition(() => {
         // 创建初始占位消息
-        const tempMessageId = `temp-${Date.now()}-${Math.floor(Math.random() * 1000)}`
+        const tempMessageId = `temp-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
         setMessages((prev) => [
           ...prev,
           {
@@ -493,285 +488,206 @@ export function AnimatedAIChat() {
             content: "",
             role: "assistant",
             timestamp: new Date(),
-            codeBlocks: [],
             isProjectRetrieval: isProjectRetrievalActive,
           },
-        ])
+        ]);
 
-        // 调用聊天服务，传入已确认的文件
+        // 调用聊天服务
         chatService
-          .chatStream(value.trim(), activeCommands, filesToUpload)
+          .chatStream(value.trim(), activeCommands, filesToSend)
           .then(async (stream) => {
-            const reader = stream.getReader()
-            const decoder = new TextDecoder()
-            let buffer = "" // 用于存储不完整的数据
-            let isInCodeBlock = false
-            let currentCodeBlock: CodeBlock | null = null
-            let normalTextBuffer = ""
+            const reader = stream.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            let content = "";
 
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
+            const processBuffer = () => {
+              if (!buffer.includes("\n")) return;
 
-              const chunk = decoder.decode(value)
-              buffer += chunk // 将新数据添加到缓冲区
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
 
-              // 按行分割并处理完整的数据行
-              const lines = buffer.split("\n")
-              buffer = lines.pop() || "" // 保留最后一个可能不完整的行
-
-              for (const line of lines) {
+              lines.forEach(line => {
                 if (line.startsWith("data:")) {
                   try {
-                    const jsonStr = line.slice(5).trim()
+                    const jsonStr = line.slice(5).trim();
                     if (jsonStr) {
-                      const data = JSON.parse(jsonStr) as ChatStreamResponse
-                      if (data.content) {
-                        // 处理代码块开始标记
-                        const codeBlockStartMatch = data.content.match(/^```(\w+)(?:\s+title="([^"]*)")?/)
-                        if (codeBlockStartMatch && !isInCodeBlock) {
-                          // 如果有累积的普通文本，先更新
-                          if (normalTextBuffer) {
-                            setMessages((prev) =>
-                              prev.map((msg) =>
-                                msg.id === tempMessageId
-                                  ? { ...msg, content: msg.content + normalTextBuffer }
-                                  : msg
-                              )
-                            )
-                            normalTextBuffer = ""
-                          }
-
-                          isInCodeBlock = true
-                          currentCodeBlock = {
-                            language: codeBlockStartMatch[1],
-                            title: codeBlockStartMatch[2] || getDefaultTitle(codeBlockStartMatch[1]),
-                            content: "",
-                            isProjectRetrieval: isProjectRetrievalActive,
-                          }
-                          continue
-                        }
-
-                        // 处理代码块结束标记
-                        if (data.content.startsWith("```") && isInCodeBlock) {
-                          isInCodeBlock = false
-                          if (currentCodeBlock) {
-                            setMessages((prev) =>
-                              prev.map((msg) =>
-                                msg.id === tempMessageId
-                                  ? {
-                                      ...msg,
-                                      codeBlocks: [...(msg.codeBlocks || []), currentCodeBlock!],
-                                    }
-                                  : msg
-                              )
-                            )
-                            currentCodeBlock = null
-                          }
-                          continue
-                        }
-
-                        // 处理代码块内容
-                        if (isInCodeBlock && currentCodeBlock) {
-                          currentCodeBlock.content += data.content + "\n"
-                        } else {
-                          // 累积普通文本
-                          normalTextBuffer += data.content
-                        }
-                      }
-
+                      const data = JSON.parse(jsonStr) as ChatStreamResponse;
+                      
                       // 保存 chatId 到聊天状态
                       if (data.chatId) {
-                        const agentId = getCurrentAgentId()
-                        const chatState = chatService.getChatState(agentId)
-                        chatState.chatId = data.chatId
+                        const agentId = getCurrentAgentId();
+                        const chatState = chatService.getChatState(agentId);
+                        chatState.chatId = data.chatId;
+                      }
+
+                      if (data.content) {
+                        content += data.content;
+                        throttledUpdate.current(tempMessageId, content);
                       }
 
                       if (data.finish) {
-                        // 处理最后可能剩余的普通文本
-                        if (normalTextBuffer) {
-                          setMessages((prev) =>
-                            prev.map((msg) =>
-                              msg.id === tempMessageId
-                                ? { ...msg, content: msg.content + normalTextBuffer }
-                                : msg
-                            )
-                          )
-                        }
-
-                        // 如果有未完成的代码块，也添加到消息中
-                        if (isInCodeBlock && currentCodeBlock) {
-                          setMessages((prev) =>
-                            prev.map((msg) =>
-                              msg.id === tempMessageId
-                                ? {
-                                    ...msg,
-                                    codeBlocks: [...(msg.codeBlocks || []), currentCodeBlock!],
-                                  }
-                                : msg
-                            )
-                          )
-                        }
-
-                        setCurrentResponse("")
+                        setCurrentResponse("");
+                        // 响应完成时重置等待状态
+                        setIsWaitingResponse(false);
                       }
                     }
                   } catch (error) {
-                    console.error("解析 SSE 数据失败:", error, "原始数据:", line)
+                    console.error("解析 SSE 数据失败:", error, "原始数据:", line);
+                    // 发生错误时也要重置等待状态
+                    setIsWaitingResponse(false);
                   }
                 }
+              });
+            };
+
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                
+                // 使用递归确保处理完所有完整行
+                while (buffer.includes("\n")) {
+                  processBuffer();
+                }
               }
+
+              // 处理剩余数据
+              if (buffer) processBuffer();
+            } catch (error) {
+              console.error("流处理错误:", error);
+              setCurrentResponse("");
+              // 移除占位消息
+              setMessages((prev) => prev.filter((msg) => msg.id !== tempMessageId));
+              // 发生错误时重置等待状态
+              setIsWaitingResponse(false);
+            } finally {
+              reader.releaseLock();
             }
           })
           .catch((error) => {
-            console.error("Chat error:", error)
-            setCurrentResponse("")
+            console.error("Chat error:", error);
+            setCurrentResponse("");
             // 移除占位消息
-            setMessages((prev) => prev.filter((msg) => msg.id !== tempMessageId))
-          })
-      })
+            setMessages((prev) => prev.filter((msg) => msg.id !== tempMessageId));
+            // 发生错误时重置等待状态
+            setIsWaitingResponse(false);
+          });
+      });
     }
-  }
+  };
 
   const handleAttachFile = () => {
-    setShowUploadDialog(true)
+    setShowUploadDialog(prev => !prev)
   }
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files
-    if (files && files.length > 0) {
-      const newFiles: FileUpload[] = []
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i]
-        const fileSizeInKB = Math.round(file.size / 1024)
-        const fileSizeStr = fileSizeInKB < 1024 ? `${fileSizeInKB} KB` : `${(fileSizeInKB / 1024).toFixed(1)} MB`
-        
-        // 验证文件大小
-        const MAX_SIZE = 10 * 1024 * 1024 // 10MB
-        if (file.size > MAX_SIZE) {
-          alert(`文件 ${file.name} 大小超过10MB限制`)
-          continue
-        }
+  const [fileMap, setFileMap] = useState<Map<string, File>>(new Map());
 
-        newFiles.push({
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    
+    // 检查文件数量限制
+    if (files.length + fileMap.size > FILE_CONSTRAINTS.MAX_FILES) {
+      alert(`最多只能上传 ${FILE_CONSTRAINTS.MAX_FILES} 个文件`);
+      e.target.value = '';
+      return;
+    }
+
+    // 过滤和验证文件
+    const validFiles = files.filter(file => {
+      // 检查文件大小
+      if (file.size > FILE_CONSTRAINTS.MAX_SIZE) {
+        alert(`${file.name} 超过10MB限制`);
+        return false;
+      }
+      
+      // 检查文件类型和扩展名
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      if (!ext || !FILE_CONSTRAINTS.ALLOWED_EXTENSIONS.includes(`.${ext}`) || 
+          !FILE_CONSTRAINTS.ALLOWED_TYPES.includes(file.type)) {
+        alert(`${file.name} 类型不支持`);
+        return false;
+      }
+      
+      // 检查是否重复
+      if (fileMap.has(file.name)) {
+        alert(`${file.name} 已存在`);
+        return false;
+      }
+      
+      return true;
+    });
+
+    if (validFiles.length > 0) {
+      const newFiles: FileUpload[] = validFiles.map(file => {
+        const fileSizeInKB = Math.round(file.size / 1024);
+        const fileSizeStr = fileSizeInKB < 1024 
+          ? `${fileSizeInKB} KB` 
+          : `${(fileSizeInKB / 1024).toFixed(1)} MB`;
+        
+        return {
           name: file.name,
           size: fileSizeStr,
           type: file.type,
-          file: file  // 保存实际文件对象
-        })
-      }
-      setUploadedFiles([...uploadedFiles, ...newFiles])
+          file: file
+        };
+      });
+      
+      setUploadedFiles(prev => [...prev, ...newFiles]);
     }
-  }
+    
+    e.target.value = '';
+  };
 
   const confirmFileUpload = () => {
-    // 保存实际文件对象
-    const newFiles = uploadedFiles.map(f => f.file)
-    setSelectedFiles(prev => [...prev, ...newFiles])
+    // 使用 Map 结构更新文件
+    setFileMap(prev => {
+      const newMap = new Map(prev);
+      uploadedFiles.forEach(f => {
+        if (!newMap.has(f.name)) {
+          newMap.set(f.name, f.file);
+        }
+      });
+      return newMap;
+    });
+
+    // 更新显示附件列表
+    setAttachments(prev => {
+      const newAttachments = uploadedFiles.map(f => f.name);
+      return [...new Set([...prev, ...newAttachments])].slice(0, FILE_CONSTRAINTS.MAX_FILES);
+    });
     
-    // 更新显示用的附件列表
-    const newAttachments = uploadedFiles.map((file) => file.name)
-    setAttachments([...attachments, ...newAttachments])
-    
-    setUploadedFiles([])
-    setShowUploadDialog(false)
-  }
+    // 清空临时上传状态
+    setUploadedFiles([]);
+    setShowUploadDialog(false);
+  };
 
   const removeAttachment = (index: number) => {
-    setSelectedFiles(prev => prev.filter((_, i) => i !== index))  // 同时移除实际文件
-    setAttachments(prev => prev.filter((_, i) => i !== index))
-  }
-
-  const handleArtifactToggle = (artifact: ArtifactData) => {
-    if (currentArtifact?.messageId === artifact.messageId && showArtifacts) {
-      setShowArtifacts(false)
-      setCurrentArtifact(null)
-      setShouldScrollToBottom(true)
-    } else {
-      setCurrentArtifact(artifact)
-      setShowArtifacts(true)
-      setArtifactMode("preview")
-      setShouldScrollToBottom(false)
+    const attachmentName = attachments[index];
+    
+    // 从 Map 中删除文件
+    setFileMap(prev => {
+      const newMap = new Map(prev);
+      newMap.delete(attachmentName);
+      return newMap;
+    });
+    
+    // 更新显示附件列表
+    setAttachments(prev => prev.filter((_, i) => i !== index));
+    
+    // 如果删除后没有文件了，重置相关状态
+    if (attachments.length === 1) {
+      setShowUploadDialog(false);
     }
-  }
+  };
 
   const handleInputFocus = () => {
     setInputFocused(true)
   }
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const newValue = e.target.value
-    setValue(newValue)
-
-    // Use requestAnimationFrame for smoother height adjustment
-    requestAnimationFrame(() => {
-      adjustHeight()
-    })
-  }
-
   const isProjectRetrievalMode = activeCommands.has("project-retrieval")
-
-  const renderTable = (content: string, isProjectRetrieval = false): string => {
-    const lines = content
-      .trim()
-      .split("\n")
-      .filter((line) => line.trim())
-    if (lines.length < 2) return content
-
-    const headers = lines[0]
-      .split("|")
-      .map((h) => h.trim())
-      .filter((h) => h)
-    const rows = lines.slice(2).map((line) =>
-      line
-        .split("|")
-        .map((cell) => cell.trim())
-        .filter((cell) => cell),
-    )
-
-    const themeClasses = isProjectRetrieval
-      ? {
-          border: "border-blue-300",
-          headerBg: "bg-blue-50",
-          headerText: "text-blue-900",
-          cellBorder: "border-blue-200",
-          hoverBg: "hover:bg-blue-50/50",
-        }
-      : {
-          border: "border-green-300",
-          headerBg: "bg-green-50",
-          headerText: "text-green-900",
-          cellBorder: "border-green-200",
-          hoverBg: "hover:bg-green-50/50",
-        }
-
-    return `
-    <div class="overflow-auto max-h-[70vh] max-w-full">
-      <table class="w-full border-collapse border ${themeClasses.border} rounded-lg overflow-hidden min-w-max">
-        <thead class="${themeClasses.headerBg} sticky top-0">
-          <tr>
-            ${headers
-              .map(
-                (header) =>
-                  `<th class="border ${themeClasses.cellBorder} px-4 py-3 text-left font-semibold ${themeClasses.headerText} whitespace-nowrap">${header}</th>`,
-              )
-              .join("")}
-          </tr>
-        </thead>
-        <tbody>
-          ${rows
-            .map(
-              (row) =>
-                `<tr class="${themeClasses.hoverBg} transition-colors">
-              ${row.map((cell) => `<td class="border ${themeClasses.cellBorder} px-4 py-3 text-gray-700 whitespace-nowrap">${cell}</td>`).join("")}
-            </tr>`,
-            )
-            .join("")}
-        </tbody>
-      </table>
-    </div>
-  `
-  }
 
   const renderMessageContent = (message: Message) => {
     if (message.role === "user") {
@@ -779,58 +695,6 @@ export function AnimatedAIChat() {
     }
 
     const components: Components = {
-      code({ node, inline, className, children, ...props }: CodeProps) {
-        if (inline) {
-          return (
-            <code className="bg-gray-100 rounded px-1 text-gray-800" {...props}>
-              {children}
-            </code>
-          );
-        }
-
-        const match = /language-(\w+)/.exec(className || "");
-        const language = match ? match[1] : "";
-        const content = String(children).trim();
-        
-        // 创建代码块对象
-        const codeBlock: CodeBlock = {
-          language,
-          content,
-          title: language ? getDefaultTitle(language) : "Code",
-          isProjectRetrieval: message.isProjectRetrieval,
-        };
-
-        // 更新消息的代码块列表
-        if (!message.codeBlocks) {
-          message.codeBlocks = [];
-        }
-        const existingIndex = message.codeBlocks.findIndex(
-          (cb) => cb.content === content && cb.language === language
-        );
-        if (existingIndex === -1) {
-          message.codeBlocks.push(codeBlock);
-        }
-
-        const artifact = createArtifact(codeBlock, message.id);
-        return (
-          <div className="my-4">
-            <motion.button
-              onClick={() => handleArtifactToggle(artifact)}
-              className={cn(
-                "flex items-center gap-2 px-4 py-2 rounded-lg transition-all",
-                message.isProjectRetrieval
-                  ? "bg-blue-100 text-blue-800 hover:bg-blue-200"
-                  : "bg-green-100 text-green-800 hover:bg-green-200"
-              )}
-              whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
-            >
-              <Code className="w-4 h-4" />
-              <span>查看 {codeBlock.title}</span>
-            </motion.button>
-          </div>
-        );
-      },
       h1: (props: ComponentPropsWithoutRef<'h1'>) => (
         <h1 className="text-2xl font-bold text-gray-900 mb-6 pb-3 border-b border-gray-200" {...props} />
       ),
@@ -858,26 +722,22 @@ export function AnimatedAIChat() {
       a: (props: ComponentPropsWithoutRef<'a'>) => (
         <a className="text-green-600 hover:text-green-700 underline" target="_blank" rel="noopener noreferrer" {...props} />
       ),
-      table: (props: ComponentPropsWithoutRef<'table'>) => (
-        <div className="overflow-auto max-h-[70vh] max-w-full">
-          <table className="w-full border-collapse border border-gray-300 rounded-lg overflow-hidden min-w-max" {...props} />
-        </div>
-      ),
-      thead: (props: ComponentPropsWithoutRef<'thead'>) => (
-        <thead className="bg-gray-50 sticky top-0" {...props} />
-      ),
-      tbody: (props: ComponentPropsWithoutRef<'tbody'>) => (
-        <tbody {...props} />
-      ),
-      tr: (props: ComponentPropsWithoutRef<'tr'>) => (
-        <tr className="hover:bg-gray-50 transition-colors" {...props} />
-      ),
-      th: (props: ComponentPropsWithoutRef<'th'>) => (
-        <th className="border border-gray-200 px-4 py-3 text-left font-semibold text-gray-900 whitespace-nowrap" {...props} />
-      ),
-      td: (props: ComponentPropsWithoutRef<'td'>) => (
-        <td className="border border-gray-200 px-4 py-3 text-gray-700 whitespace-nowrap" {...props} />
-      ),
+      code: ({ node, inline, className, children, ...props }: CodeProps) => {
+        if (inline) {
+          return (
+            <code className="bg-gray-100 rounded px-1 text-gray-800" {...props}>
+              {children}
+            </code>
+          );
+        }
+        return (
+          <pre className="bg-gray-50 p-4 rounded-lg overflow-x-auto my-4">
+            <code className={className} {...props}>
+              {children}
+            </code>
+          </pre>
+        );
+      },
     };
 
     return (
@@ -910,7 +770,7 @@ export function AnimatedAIChat() {
           <motion.div
             className="flex flex-col h-full"
             animate={{
-              width: showArtifacts ? "50%" : "100%",
+              width: "100%",
             }}
             transition={{ duration: 0.4, ease: [0.4, 0, 0.2, 1] }}
           >
@@ -970,104 +830,63 @@ export function AnimatedAIChat() {
                               {message.content ? renderMessageContent(message) : (message.role === "assistant" && <TypingDots />)}
                             </div>
 
-                            {/* Enhanced Code Block Preview Cards */}
-                            {message.codeBlocks && message.codeBlocks.length > 0 && (
-                              <div className="space-y-3">
-                                {message.codeBlocks.map((codeBlock, blockIndex) => {
-                                  const artifact = createArtifact(codeBlock, message.id)
-                                  const isActive = currentArtifact?.messageId === message.id && showArtifacts
-                                  const isProjectRetrievalBlock = codeBlock.isProjectRetrieval
-
-                                  return (
-                                    <motion.button
-                                      key={blockIndex}
-                                      onClick={() => handleArtifactToggle(artifact)}
-                                      className={cn(
-                                        "flex items-center gap-4 p-4 rounded-xl transition-all text-left w-full group shadow-sm border",
-                                        isActive
-                                          ? isProjectRetrievalBlock
-                                            ? "bg-blue-50 border-blue-300 shadow-md"
-                                            : "bg-green-50 border-green-300 shadow-md"
-                                          : isProjectRetrievalBlock
-                                            ? "bg-white border-blue-200 hover:border-blue-300 hover:bg-blue-50/30"
-                                            : "bg-white border-gray-200 hover:border-green-300 hover:bg-green-50/30",
-                                      )}
-                                      whileHover={{ scale: 1.01, y: -1 }}
-                                      whileTap={{ scale: 0.99 }}
-                                    >
-                                      <div
-                                        className={cn(
-                                          "w-12 h-12 rounded-lg flex items-center justify-center flex-shrink-0 shadow-sm",
-                                          isActive
-                                            ? isProjectRetrievalBlock
-                                              ? "bg-gradient-to-br from-blue-200 to-blue-300"
-                                              : "bg-gradient-to-br from-green-200 to-green-300"
-                                            : isProjectRetrievalBlock
-                                              ? "bg-gradient-to-br from-blue-100 to-blue-200"
-                                              : "bg-gradient-to-br from-green-100 to-green-200",
-                                        )}
-                                      >
-                                        <Code
-                                          className={cn(
-                                            "w-6 h-6",
-                                            isProjectRetrievalBlock ? "text-blue-700" : "text-green-700",
-                                          )}
-                                        />
-                                      </div>
-                                      <div className="flex-1 min-w-0">
-                                        <div className="font-semibold text-gray-900 text-sm mb-1">
-                                          {codeBlock.title}
-                                        </div>
-                                        <div className="text-xs text-gray-500">
-                                          点击查看 {codeBlock.language.toUpperCase()} 内容
-                                        </div>
-                                      </div>
-                                      <div
-                                        className={cn(
-                                          "flex items-center gap-1 text-xs transition-colors",
-                                          isActive
-                                            ? isProjectRetrievalBlock
-                                              ? "text-blue-600"
-                                              : "text-green-600"
-                                            : isProjectRetrievalBlock
-                                              ? "text-gray-400 group-hover:text-blue-600"
-                                              : "text-gray-400 group-hover:text-green-600",
-                                        )}
-                                      >
-                                        {isActive ? (
-                                          <Minimize2 className="w-4 h-4" />
-                                        ) : (
-                                          <Maximize2 className="w-4 h-4" />
-                                        )}
-                                      </div>
-                                    </motion.button>
-                                  )
-                                })}
-                              </div>
-                            )}
-
                             {/* Enhanced Copy Button */}
                             {message.role === "assistant" && (
                               <motion.button
                                 onClick={() => handleCopyMessage(message)}
-                                className="self-start flex items-center gap-2 px-3 py-2 text-xs text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
-                              >
-                                {copiedMessageId === message.id ? (
-                                  <div
-                                    className={cn(
-                                      "flex items-center gap-2",
-                                      message.isProjectRetrieval ? "text-blue-600" : "text-green-600",
-                                    )}
-                                  >
-                                    <Check className="w-3 h-3" />
-                                    <span>已复制</span>
-                                  </div>
-                                ) : (
-                                  <div className="flex items-center gap-2">
-                                    <Copy className="w-3 h-3" />
-                                    <span>复制</span>
-                                  </div>
+                                className={cn(
+                                  "self-start flex items-center gap-2 px-4 py-2.5 text-xs rounded-full transition-all duration-200",
+                                  copiedMessageId === message.id
+                                    ? message.isProjectRetrieval
+                                      ? "bg-blue-50 text-blue-600 shadow-sm"
+                                      : "bg-green-50 text-green-600 shadow-sm"
+                                    : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"
                                 )}
+                                whileHover={{ scale: 1.02 }}
+                                whileTap={{ scale: 0.98 }}
+                              >
+                                <AnimatePresence mode="wait">
+                                  {copiedMessageId === message.id ? (
+                                    <motion.div
+                                      key="check"
+                                      className="flex items-center gap-2"
+                                      initial={{ opacity: 0, scale: 0.8 }}
+                                      animate={{ opacity: 1, scale: 1 }}
+                                      exit={{ opacity: 0, scale: 0.8 }}
+                                      transition={{ duration: 0.2 }}
+                                    >
+                                      <motion.div
+                                        initial={{ scale: 0 }}
+                                        animate={{ scale: 1 }}
+                                        transition={{ type: "spring", stiffness: 500, damping: 30 }}
+                                        className="w-4 h-4 rounded-full bg-blue-100 flex items-center justify-center"
+                                      >
+                                        <Check className="w-2.5 h-2.5" />
+                                      </motion.div>
+                                      <motion.span
+                                        initial={{ opacity: 0, x: -5 }}
+                                        animate={{ opacity: 1, x: 0 }}
+                                        transition={{ delay: 0.1 }}
+                                      >
+                                        已复制
+                                      </motion.span>
+                                    </motion.div>
+                                  ) : (
+                                    <motion.div
+                                      key="copy"
+                                      className="flex items-center gap-2"
+                                      initial={{ opacity: 0, scale: 0.8 }}
+                                      animate={{ opacity: 1, scale: 1 }}
+                                      exit={{ opacity: 0, scale: 0.8 }}
+                                      transition={{ duration: 0.2 }}
+                                    >
+                                      <div className="w-4 h-4 rounded-full bg-gray-100 flex items-center justify-center">
+                                        <Copy className="w-2.5 h-2.5" />
+                                      </div>
+                                      <span>复制</span>
+                                    </motion.div>
+                                  )}
+                                </AnimatePresence>
                               </motion.button>
                             )}
                           </div>
@@ -1154,28 +973,32 @@ export function AnimatedAIChat() {
                             return (
                               <motion.button
                                 key={option.id}
-                                onClick={() => selectCommand(option.id)}
+                                onClick={() => !option.disabled && selectCommand(option.id)}
                                 className={cn(
-                                  "flex items-center gap-3 px-3 py-3 text-sm transition-all cursor-pointer w-full rounded-lg",
-                                  isActive
-                                    ? option.id === "project-retrieval"
-                                      ? "bg-blue-100 text-blue-800 border border-blue-200"
-                                      : "bg-green-100 text-green-800 border border-green-200"
-                                    : "text-gray-700 hover:bg-gray-50",
+                                  "flex items-center gap-3 px-3 py-3 text-sm transition-all w-full rounded-xl",
+                                  option.disabled
+                                    ? "opacity-50 cursor-not-allowed bg-gray-50 text-gray-400"
+                                    : isActive
+                                      ? option.id === "project-retrieval"
+                                        ? "bg-blue-100 text-blue-800 border border-blue-200"
+                                        : "bg-green-100 text-green-800 border border-green-200"
+                                      : "text-gray-700 hover:bg-gray-50 cursor-pointer",
                                 )}
                                 initial={{ opacity: 0, x: -10 }}
                                 animate={{ opacity: 1, x: 0 }}
-                                whileHover={{ scale: 1.01 }}
-                                whileTap={{ scale: 0.99 }}
+                                whileHover={!option.disabled ? { scale: 1.01 } : undefined}
+                                whileTap={!option.disabled ? { scale: 0.99 } : undefined}
                               >
                                 <div
                                   className={cn(
                                     "w-6 h-6 flex items-center justify-center rounded",
-                                    isActive
-                                      ? option.id === "project-retrieval"
-                                        ? "text-blue-700"
-                                        : "text-green-700"
-                                      : "text-gray-600",
+                                    option.disabled
+                                      ? "text-gray-400"
+                                      : isActive
+                                        ? option.id === "project-retrieval"
+                                          ? "text-blue-700"
+                                          : "text-green-700"
+                                        : "text-gray-600",
                                   )}
                                 >
                                   {option.icon}
@@ -1187,16 +1010,18 @@ export function AnimatedAIChat() {
                                 <div
                                   className={cn(
                                     "text-xs font-mono px-2 py-1 rounded",
-                                    isActive
-                                      ? option.id === "project-retrieval"
-                                        ? "bg-blue-200 text-blue-800"
-                                        : "bg-green-200 text-green-800"
-                                      : "bg-gray-100 text-gray-400",
+                                    option.disabled
+                                      ? "bg-gray-100 text-gray-400"
+                                      : isActive
+                                        ? option.id === "project-retrieval"
+                                          ? "bg-blue-200 text-blue-800"
+                                          : "bg-green-200 text-green-800"
+                                        : "bg-gray-100 text-gray-400",
                                   )}
                                 >
                                   {option.prefix}
                                 </div>
-                                {isActive && (
+                                {isActive && !option.disabled && (
                                   <motion.div
                                     className={cn(
                                       "w-2 h-2 rounded-full",
@@ -1295,7 +1120,7 @@ export function AnimatedAIChat() {
                                 setSelectedFiles([])
                                 setShowUploadDialog(false)
                               }}
-                              className="px-4 py-2 text-sm text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors"
+                              className="px-4 py-2 text-sm text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-xl transition-colors"
                             >
                               取消
                             </button>
@@ -1303,7 +1128,7 @@ export function AnimatedAIChat() {
                               onClick={confirmFileUpload}
                               disabled={uploadedFiles.length === 0}
                               className={cn(
-                                "px-4 py-2 text-sm rounded-lg transition-all flex items-center gap-2",
+                                "px-4 py-2 text-sm rounded-xl transition-all flex items-center gap-2",
                                 uploadedFiles.length > 0
                                   ? "bg-green-500 text-white hover:bg-green-600 shadow-sm"
                                   : "bg-gray-200 text-gray-400 cursor-not-allowed",
@@ -1335,6 +1160,8 @@ export function AnimatedAIChat() {
                         })
                       }}
                       onKeyDown={handleKeyDown}
+                      onCompositionStart={handleCompositionStart}
+                      onCompositionEnd={handleCompositionEnd}
                       onFocus={handleInputFocus}
                       isFocused={inputFocused}
                       placeholder="向 AI 助手提问..."
@@ -1404,7 +1231,7 @@ export function AnimatedAIChat() {
                         {attachments.map((file, index) => (
                           <motion.div
                             key={index}
-                            className="flex items-center gap-2 text-sm bg-blue-50 text-blue-800 py-2 px-3 rounded-lg border border-blue-200"
+                            className="flex items-center gap-2 text-sm bg-green-50 text-green-800 py-2 px-3 rounded-lg border border-green-200"
                             initial={{ opacity: 0, scale: 0.9 }}
                             animate={{ opacity: 1, scale: 1 }}
                             exit={{ opacity: 0, scale: 0.9 }}
@@ -1413,7 +1240,7 @@ export function AnimatedAIChat() {
                             <span className="font-medium">{file}</span>
                             <button
                               onClick={() => removeAttachment(index)}
-                              className="text-blue-600 hover:text-red-500 transition-colors"
+                              className="text-green-600 hover:text-red-500 transition-colors"
                             >
                               <XIcon className="w-3 h-3" />
                             </button>
@@ -1432,12 +1259,27 @@ export function AnimatedAIChat() {
                           data-upload-button
                           onClick={handleAttachFile}
                           whileTap={{ scale: 0.95 }}
-                          className="p-3 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-xl transition-all relative group"
+                          className={cn(
+                            "p-3 rounded-xl transition-all relative group",
+                            showUploadDialog
+                              ? "bg-green-100 text-green-700 shadow-sm border border-green-200"
+                              : "text-gray-500 hover:text-gray-700 hover:bg-gray-100"
+                          )}
                         >
                           <Paperclip className="w-5 h-5" />
-                          <span className="absolute -top-10 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
+                          <span className="absolute -top-10 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white text-xs px-2 py-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap">
                             上传文件
                           </span>
+                          {attachments.length > 0 && (
+                            <motion.div
+                              className="absolute -top-1 -right-1 w-5 h-5 rounded-full flex items-center justify-center bg-green-500"
+                              initial={{ scale: 0 }}
+                              animate={{ scale: 1 }}
+                              transition={{ type: "spring", stiffness: 500, damping: 30 }}
+                            >
+                              <span className="text-white text-xs font-bold">{attachments.length}</span>
+                            </motion.div>
+                          )}
                         </motion.button>
                       )}
 
@@ -1480,11 +1322,11 @@ export function AnimatedAIChat() {
                       onClick={handleSendMessage}
                       whileHover={{ scale: 1.02 }}
                       whileTap={{ scale: 0.98 }}
-                      disabled={!value.trim()}
+                      disabled={!value.trim() || isWaitingResponse}
                       className={cn(
                         "px-6 py-3 rounded-xl text-sm font-medium transition-all",
                         "flex items-center gap-2 button-hover-effect",
-                        value.trim()
+                        value.trim() && !isWaitingResponse
                           ? isProjectRetrievalMode
                             ? "bg-gradient-to-r from-blue-500 to-blue-600 text-white shadow-lg shadow-blue-500/25 hover:shadow-blue-500/40"
                             : "bg-gradient-to-r from-green-500 to-green-600 text-white shadow-lg shadow-green-500/25 hover:shadow-green-500/40"
@@ -1499,135 +1341,6 @@ export function AnimatedAIChat() {
               </div>
             </div>
           </motion.div>
-
-          {/* Enhanced Artifacts Panel */}
-          <AnimatePresence>
-            {showArtifacts && currentArtifact && (
-              <motion.div
-                className="w-1/2 border-l border-gray-200 bg-white flex flex-col h-full"
-                initial={{ x: "100%", opacity: 0 }}
-                animate={{ x: 0, opacity: 1 }}
-                exit={{ x: "100%", opacity: 0 }}
-                transition={{ duration: 0.4, ease: [0.4, 0, 0.2, 1] }}
-              >
-                {/* Enhanced Artifacts Header */}
-                <div className="flex items-center justify-between p-6 border-b border-gray-200 bg-gradient-to-r from-gray-50 to-white backdrop-blur-sm">
-                  <div className="flex items-center gap-4">
-                    <div
-                      className={cn(
-                        "w-12 h-12 rounded-xl flex items-center justify-center shadow-sm border",
-                        currentArtifact.isProjectRetrieval
-                          ? "bg-gradient-to-br from-blue-100 to-blue-200 border-blue-200/50"
-                          : "bg-gradient-to-br from-green-100 to-green-200 border-green-200/50",
-                      )}
-                    >
-                      <Code
-                        className={cn(
-                          "w-6 h-6",
-                          currentArtifact.isProjectRetrieval ? "text-blue-700" : "text-green-700",
-                        )}
-                      />
-                    </div>
-                    <div>
-                      <h3 className="font-semibold text-gray-900 text-base">{currentArtifact.title}</h3>
-                      <p className="text-sm text-gray-600">{currentArtifact.language.toUpperCase()}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <div className="flex bg-white rounded-xl border border-gray-200 p-1 shadow-sm">
-                      <button
-                        onClick={() => setArtifactMode("preview")}
-                        className={cn(
-                          "px-4 py-2 text-sm font-medium rounded-lg transition-all flex items-center gap-2",
-                          artifactMode === "preview"
-                            ? currentArtifact.isProjectRetrieval
-                              ? "bg-blue-500 text-white shadow-sm"
-                              : "bg-green-500 text-white shadow-sm"
-                            : "text-gray-600 hover:text-gray-900 hover:bg-gray-50",
-                        )}
-                      >
-                        <Eye className="w-4 h-4" />
-                        预览
-                      </button>
-                      <button
-                        onClick={() => setArtifactMode("code")}
-                        className={cn(
-                          "px-4 py-2 text-sm font-medium rounded-lg transition-all flex items-center gap-2",
-                          artifactMode === "code"
-                            ? currentArtifact.isProjectRetrieval
-                              ? "bg-blue-500 text-white shadow-sm"
-                              : "bg-green-500 text-white shadow-sm"
-                            : "text-gray-600 hover:text-gray-900 hover:bg-gray-50",
-                        )}
-                      >
-                        <Code className="w-4 h-4" />
-                        代码
-                      </button>
-                    </div>
-                    <button
-                      onClick={() => {
-                        setShowArtifacts(false)
-                        setShouldScrollToBottom(true)
-                      }}
-                      className="p-2 text-gray-400 hover:text-gray-600 rounded-lg transition-colors hover:bg-gray-100"
-                    >
-                      <XIcon className="w-5 h-5" />
-                    </button>
-                  </div>
-                </div>
-
-                {/* Enhanced Artifacts Content */}
-                <div className="flex-1 overflow-hidden">
-                  {artifactMode === "preview" ? (
-                    // Preview Mode
-                    currentArtifact.language === "table" ? (
-                      <div
-                        className={cn(
-                          "h-full overflow-hidden p-8",
-                          currentArtifact.isProjectRetrieval
-                            ? "scrollbar-thin scrollbar-thumb-blue-300 scrollbar-track-transparent"
-                            : "scrollbar-thin scrollbar-thumb-green-300 scrollbar-track-transparent",
-                        )}
-                        dangerouslySetInnerHTML={{
-                          __html: renderTable(currentArtifact.content, currentArtifact.isProjectRetrieval),
-                        }}
-                      />
-                    ) : currentArtifact.language === "report" || currentArtifact.language === "markdown" ? (
-                      <div
-                        ref={artifactsContainerRef}
-                        className="h-full overflow-y-auto p-8 scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent"
-                        style={{ scrollBehavior: "smooth" }}
-                      >
-                        <div
-                          className="prose prose-sm max-w-none text-gray-800 leading-relaxed"
-                          dangerouslySetInnerHTML={{ __html: renderMarkdown(currentArtifact.content) }}
-                        />
-                      </div>
-                    ) : (
-                      <div
-                        className="h-full overflow-y-auto scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent"
-                        style={{ scrollBehavior: "smooth" }}
-                      >
-                        <pre className="p-8 text-sm text-gray-800 font-mono whitespace-pre-wrap bg-gray-50 h-full leading-relaxed">
-                          {currentArtifact.content}
-                        </pre>
-                      </div>
-                    )
-                  ) : (
-                    // Code Mode - Show raw source code
-                    <div
-                      className="h-full overflow-y-auto scrollbar-thin scrollbar-thumb-gray-300 scrollbar-track-transparent"
-                      style={{ scrollBehavior: "smooth" }}
-                    >
-                      <pre className="p-8 text-sm text-gray-800 font-mono whitespace-pre-wrap bg-gray-50 h-full leading-relaxed">
-                        {`\`\`\`${currentArtifact.language}${currentArtifact.title ? ` title="${currentArtifact.title}"` : ""}\n${currentArtifact.content}\n\`\`\``}
-                      </pre>
-                    </div>
-                  )}
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </div>
 
         {/* Enhanced Focus Effect */}

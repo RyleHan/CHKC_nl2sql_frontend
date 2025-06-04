@@ -71,20 +71,30 @@ export class ChatService {
             for (const file of files) {
                 console.log('正在上传文件:', file.name);
                 try {
+                    // 检查文件是否已经上传过
+                    const existingFile = chatState.files.find(f => f.fileName === file.name);
+                    if (existingFile) {
+                        console.log('文件已存在，跳过上传:', file.name);
+                        uploadedFiles.push(existingFile);
+                        continue;
+                    }
+
                     const fileId = await this.uploadFile(file);
-                    uploadedFiles.push({
+                    const newFile = {
                         fileId,
                         fileName: file.name
-                    });
-                    console.log('文件上传完成:', { fileId, fileName: file.name });
+                    };
+                    uploadedFiles.push(newFile);
+                    console.log('文件上传完成:', newFile);
                 } catch (error) {
                     console.error('文件上传失败:', error);
                     throw error;
                 }
             }
 
-            // 更新聊天状态
-            chatState.files = [...chatState.files, ...uploadedFiles];
+            // 更新聊天状态，使用 Set 去重
+            const uniqueFiles = new Set([...chatState.files, ...uploadedFiles]);
+            chatState.files = Array.from(uniqueFiles);
             console.log('更新后的聊天状态:', chatState);
         }
 
@@ -93,7 +103,7 @@ export class ChatService {
         const response = await this.agentClient.chatStream({
             userInput,
             chatId: chatState.chatId?.toString() || null,
-            files: uploadedFiles.length > 0 ? chatState.files : null,  // 只在有文件时传递文件信息
+            files: chatState.files,  // 始终传递所有文件
             state: {}  // 如果需要其他状态信息
         });
 
